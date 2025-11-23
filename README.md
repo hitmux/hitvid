@@ -11,7 +11,7 @@ We've completely rewritten hitvid in Go, achieving a performance leap! We've lev
 
 However, we still keep the previous shell version in the `/old` directory, leaving it as a last resort for platforms that are really incompatible (although there are almost no such platforms).
 
-## [Hitmux Official Website https://hitmux.top](https://hitmux.top)
+## [Hitmux Official Website https://hitmux.org](https://hitmux.org)
 
 ## Key Features
 
