@@ -2,8 +2,6 @@
 
 [![Go Version](https://img.shields.io/badge/go-1.18+-blue.svg)](https://golang.org)
 [![License: AGPLv3](https://img.shields.io/badge/License-AGPLv3-yellow.svg)](https://opensource.org/licenses/AGPLv3)
-[![Build Status](https://img.shields.io/badge/build-passing-brightgreen.svg)](https://github.com/google/gemini-prompt-gallery)
-[![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](https://github.com/google/gemini-prompt-gallery)
 
 `hitvid` is a high-performance, feature-rich video player designed to run directly in your terminal. It leverages the power of **ffmpeg** for video processing and **chafa** for superior character-based rendering to deliver a smooth playback experience. It features a sophisticated concurrency model for pre-rendering frames, ensuring that playback is not hindered by on-the-fly processing.
 
