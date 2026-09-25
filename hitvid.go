@@ -12,14 +12,15 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
-
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/exec"
@@ -54,6 +55,7 @@ var (
 	currentFrameIndex           = 0
 	totalFrames                 = 0
 	extractionComplete          = false
+	renderingComplete           = false
 	currentSpeedMultiplierIndex = 3 // Index for 1.0x speed
 
 	// Playback configuration
@@ -61,17 +63,182 @@ var (
 	seekAmountInFrames       = 0
 
 	// Concurrency
-	stateMutex        sync.Mutex
-	frameReadyCond    *sync.Cond
-	renderedFrames    [][]byte
-	lastRenderedFrame = -1
-	userAction        = ""
+	stateMutex     sync.Mutex
+	frameReadyCond *sync.Cond
+	userAction     = ""
 )
 
 const seekSeconds = 5
 
+func seekTargetFrame(currentFrame, delta, totalFrames int) int {
+	target := currentFrame + delta
+	if target < 0 {
+		return 0
+	}
+	if totalFrames > 0 && target >= totalFrames {
+		return totalFrames - 1
+	}
+	return target
+}
+
+func validateNumThreads(threads int) error {
+	if threads < 1 {
+		return fmt.Errorf("-threads must be at least 1 (got %d)", threads)
+	}
+	return nil
+}
+
 var supportedVideoExtensions = map[string]bool{
 	".mp4": true, ".mkv": true, ".mov": true, ".avi": true, ".webm": true, ".flv": true,
+}
+
+const renderedFrameCapacity = 120
+
+type renderJob struct {
+	index int
+	jpeg  []byte
+}
+
+type inputEvent byte
+
+const (
+	inputQuit inputEvent = iota
+	inputPause
+	inputSpeedUp
+	inputSpeedDown
+	inputPrev
+	inputNext
+	inputSeekForward
+	inputSeekBackward
+)
+
+// readInputEvents is the process-wide stdin reader. Playback sessions only
+// consume decoded events from its channel, so seeking never starts another
+// goroutine blocked in os.Stdin.Read.
+func readInputEvents() <-chan inputEvent {
+	return inputEventsFromReader(os.Stdin)
+}
+
+func inputEventsFromReader(r io.Reader) <-chan inputEvent {
+	events := make(chan inputEvent, 16)
+	go func() {
+		defer close(events)
+		reader := bufio.NewReader(r)
+		for {
+			first, err := reader.ReadByte()
+			if err != nil {
+				return
+			}
+			var event inputEvent
+			switch {
+			case first == 'q' || first == 3:
+				event = inputQuit
+			case first == ' ':
+				event = inputPause
+			case first == '+':
+				event = inputSpeedUp
+			case first == '-':
+				event = inputSpeedDown
+			case first == '\x1b':
+				second, secondErr := reader.ReadByte()
+				third, thirdErr := reader.ReadByte()
+				if secondErr != nil || thirdErr != nil || second != '[' {
+					continue
+				}
+				switch third {
+				case 'A':
+					event = inputPrev
+				case 'B':
+					event = inputNext
+				case 'C':
+					event = inputSeekForward
+				case 'D':
+					event = inputSeekBackward
+				default:
+					continue
+				}
+			default:
+				continue
+			}
+			events <- event
+		}
+	}()
+	return events
+}
+
+// renderedFrameStore keeps only frames that are waiting for playback. The
+// decoder is back-pressured by frameSlots, so this map cannot grow without
+// bound during a long video.
+type renderedFrameStore struct {
+	frames map[int][]byte
+}
+
+func newRenderedFrameStore() *renderedFrameStore {
+	return &renderedFrameStore{frames: make(map[int][]byte, renderedFrameCapacity)}
+}
+
+func (s *renderedFrameStore) put(index int, content []byte) {
+	s.frames[index] = content
+}
+
+func (s *renderedFrameStore) take(index int) ([]byte, bool) {
+	content, ok := s.frames[index]
+	if ok {
+		delete(s.frames, index)
+	}
+	return content, ok
+}
+
+// streamJPEGFrames splits FFmpeg's image2pipe output into complete JPEG
+// images. JPEG byte stuffing keeps FFD9 reserved for the end marker.
+func streamJPEGFrames(ctx context.Context, r io.Reader, emit func([]byte) error) error {
+	const chunkSize = 64 * 1024
+	const maxJPEGSize = 64 * 1024 * 1024
+	buffer := make([]byte, 0, chunkSize*2)
+	chunk := make([]byte, chunkSize)
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		n, err := r.Read(chunk)
+		if n > 0 {
+			buffer = append(buffer, chunk[:n]...)
+			for {
+				start := bytes.Index(buffer, []byte{0xff, 0xd8})
+				if start < 0 {
+					if len(buffer) > 1 {
+						buffer = buffer[len(buffer)-1:]
+					}
+					break
+				}
+				endRel := bytes.Index(buffer[start+2:], []byte{0xff, 0xd9})
+				if endRel < 0 {
+					if start > 0 {
+						buffer = buffer[start:]
+					}
+					break
+				}
+				end := start + 2 + endRel + 2
+				frame := append([]byte(nil), buffer[start:end]...)
+				if err := emit(frame); err != nil {
+					return err
+				}
+				buffer = buffer[end:]
+			}
+			if len(buffer) > maxJPEGSize {
+				return fmt.Errorf("JPEG frame exceeds %d bytes", maxJPEGSize)
+			}
+		}
+		if err != nil {
+			if err == io.EOF {
+				if len(bytes.TrimSpace(buffer)) != 0 {
+					return fmt.Errorf("incomplete JPEG frame at end of FFmpeg stream")
+				}
+				return nil
+			}
+			return err
+		}
+	}
 }
 
 // getPlaylist scans a directory for video files and returns a sorted list.
@@ -121,73 +288,72 @@ func formatTime(frameIndex int, frameRate int) string {
 	return fmt.Sprintf("%02d:%02d", minutes, seconds)
 }
 
-// handleInput processes keyboard events for playback control.
-func handleInput(cancel context.CancelFunc) {
-	buf := make([]byte, 3)
+// handleInput applies events to one playback session. The process-wide reader
+// remains alive when this session is cancelled.
+func handleInput(ctx context.Context, events <-chan inputEvent, cancel context.CancelFunc) {
 	for {
-		// Check if the input handler should terminate
-		stateMutex.Lock()
-		action := userAction
-		stateMutex.Unlock()
-		if action == "quit" {
+		select {
+		case <-ctx.Done():
 			return
-		}
-
-		n, err := os.Stdin.Read(buf)
-		if err != nil {
-			return
-		}
-
-		stateMutex.Lock()
-		switch {
-		case n == 1 && (buf[0] == 'q' || buf[0] == 3): // 'q' or Ctrl+C
-			userAction = "quit"
-			cancel()
-		case n == 1 && buf[0] == ' ':
-			isPaused = !isPaused
-		case n == 1 && buf[0] == '+': // Increase speed
-			if currentSpeedMultiplierIndex < len(playbackSpeedMultipliers)-1 {
-				currentSpeedMultiplierIndex++
+		case event, ok := <-events:
+			if !ok {
+				cancel()
+				return
 			}
-		case n == 1 && buf[0] == '-': // Decrease speed
-			if currentSpeedMultiplierIndex > 0 {
-				currentSpeedMultiplierIndex--
+			if ctx.Err() != nil {
+				return
 			}
-		case n == 3 && buf[0] == '\x1b' && buf[1] == '[': // Arrow keys
-			switch buf[2] {
-			case 'A': // Up Arrow: Previous video
+			stateMutex.Lock()
+			switch event {
+			case inputQuit:
+				userAction = "quit"
+				cancel()
+			case inputPause:
+				isPaused = !isPaused
+			case inputSpeedUp:
+				if currentSpeedMultiplierIndex < len(playbackSpeedMultipliers)-1 {
+					currentSpeedMultiplierIndex++
+				}
+			case inputSpeedDown:
+				if currentSpeedMultiplierIndex > 0 {
+					currentSpeedMultiplierIndex--
+				}
+			case inputPrev:
 				userAction = "prev"
 				cancel()
-			case 'B': // Down Arrow: Next video
+			case inputNext:
 				userAction = "next"
 				cancel()
-			case 'C': // Right Arrow: Seek forward
-				currentFrameIndex += seekAmountInFrames
-				if totalFrames > 0 && currentFrameIndex >= totalFrames {
-					currentFrameIndex = totalFrames - 1
-				}
-			case 'D': // Left Arrow: Seek backward
-				currentFrameIndex -= seekAmountInFrames
-				if currentFrameIndex < 0 {
-					currentFrameIndex = 0
-				}
+			case inputSeekForward:
+				userAction = "seek-forward"
+				cancel()
+			case inputSeekBackward:
+				userAction = "seek-backward"
+				cancel()
 			}
+			if userAction == "quit" || userAction == "next" || userAction == "prev" || strings.HasPrefix(userAction, "seek-") {
+				frameReadyCond.Broadcast()
+			}
+			stateMutex.Unlock()
 		}
-		stateMutex.Unlock()
 	}
 }
 
-// playVideo handles the entire lifecycle of playing one video.
-// It returns the action the user took (e.g., "next", "prev", "quit") or "finished".
-func playVideo(ctx context.Context, path string) string {
+// playVideo handles one in-memory playback session. startFrame is used when a
+// seek restarts FFmpeg at a new timestamp.
+func playVideo(ctx context.Context, path string, startFrame int) string {
+	if nativeBackendAvailable() {
+		return playVideoNative(ctx, path, startFrame)
+	}
+
 	// --- Reset state for the new video ---
 	stateMutex.Lock()
 	isPaused = false
-	currentFrameIndex = 0
+	currentFrameIndex = startFrame
 	totalFrames = 0
 	extractionComplete = false
-	renderedFrames = make([][]byte, 0, 2048)
-	lastRenderedFrame = -1
+	renderingComplete = false
+	frameStore := newRenderedFrameStore()
 	userAction = "" // Clear previous action
 	stateMutex.Unlock()
 
@@ -201,99 +367,115 @@ func playVideo(ctx context.Context, path string) string {
 		stateMutex.Unlock()
 	}
 
-	// --- Setup temp dir ---
-	tempDir, err := os.MkdirTemp("", "hitvid-go-*")
-	if err != nil {
-		log.Fatalf("Failed to create temp directory: %v", err)
+	if totalFrames > 0 && startFrame >= totalFrames {
+		startFrame = totalFrames - 1
+		stateMutex.Lock()
+		currentFrameIndex = startFrame
+		stateMutex.Unlock()
 	}
-	defer os.RemoveAll(tempDir)
-	jpgDir := filepath.Join(tempDir, "jpg_frames")
-	os.Mkdir(jpgDir, 0755)
 
-	// --- Setup rendering pipeline ---
-	type renderJob struct {
-		index   int
-		jpgPath string
-	}
+	// --- Setup in-memory rendering pipeline ---
 	var wgRender sync.WaitGroup
-	jobs := make(chan renderJob, 100)
+	jobs := make(chan renderJob, numThreads*2)
+	frameSlots := make(chan struct{}, renderedFrameCapacity)
+	sessionCtx, sessionCancel := context.WithCancel(ctx)
+	defer sessionCancel()
 	for i := 0; i < numThreads; i++ {
 		wgRender.Add(1)
 		go func() {
 			defer wgRender.Done()
 			for job := range jobs {
-				chafaArgs := []string{"--size", fmt.Sprintf("%dx%d", width, height), "--symbols", symbols, "--colors", colors, "--dither", dither, job.jpgPath}
-				chafaCmd := exec.CommandContext(ctx, "chafa", chafaArgs...)
+				chafaArgs := []string{"--size", fmt.Sprintf("%dx%d", width, height), "--symbols", symbols, "--colors", colors, "--dither", dither, "-"}
+				chafaCmd := exec.CommandContext(sessionCtx, "chafa", chafaArgs...)
+				chafaCmd.Stdin = bytes.NewReader(job.jpeg)
 				output, err := chafaCmd.Output()
 				if err != nil {
-					if ctx.Err() == nil {
-						log.Printf("chafa failed for %s: %v\r\n", job.jpgPath, err)
+					if sessionCtx.Err() == nil {
+						log.Printf("chafa failed for frame %d: %v\r\n", job.index, err)
 					}
 					output = nil
 				}
 				if runtime.GOOS != "windows" && output != nil {
 					output = bytes.ReplaceAll(output, []byte("\n"), []byte("\r\n"))
 				}
-				// CRITICAL FIX: This section is now simplified to remove the faulty conditional check.
-				// It now guarantees a broadcast for every job received, fixing the deadlock.
 				stateMutex.Lock()
-				renderedFrames[job.index] = output
-				lastRenderedFrame = job.index
+				frameStore.put(job.index, output)
 				frameReadyCond.Broadcast()
 				stateMutex.Unlock()
 			}
 		}()
 	}
 
-	// --- Start dispatcher and ffmpeg ---
-	go func() {
-		dispatchedFrameIndex := 0
-		for {
-			if ctx.Err() != nil {
-				break
-			}
-			framePath := filepath.Join(jpgDir, fmt.Sprintf("frame-%05d.jpg", dispatchedFrameIndex+1))
-			if _, err := os.Stat(framePath); err == nil {
-				stateMutex.Lock()
-				if len(renderedFrames) <= dispatchedFrameIndex {
-					renderedFrames = append(renderedFrames, nil)
-				}
-				stateMutex.Unlock()
-				jobs <- renderJob{index: dispatchedFrameIndex, jpgPath: framePath}
-				dispatchedFrameIndex++
-			} else {
-				stateMutex.Lock()
-				isDone := extractionComplete
-				stateMutex.Unlock()
-				if isDone {
-					break
-				}
-				time.Sleep(10 * time.Millisecond)
-			}
-		}
-		close(jobs)
-	}()
-
+	// --- Start FFmpeg and stream JPEG frames directly through stdout ---
 	ffmpegVF := fmt.Sprintf("fps=%d,scale='min(iw,%d)':-1", fps, width*8)
-	ffmpegArgs := []string{"-nostdin", "-hide_banner", "-loglevel", "warning", "-i", path, "-vf", ffmpegVF, "-q:v", "2", filepath.Join(jpgDir, "frame-%05d.jpg")}
-	ffmpegCmd := exec.CommandContext(ctx, "ffmpeg", ffmpegArgs...)
+	ffmpegArgs := []string{"-nostdin", "-hide_banner", "-loglevel", "warning", "-i", path}
+	if startFrame > 0 {
+		ffmpegArgs = append(ffmpegArgs, "-ss", fmt.Sprintf("%.3f", float64(startFrame)/float64(fps)))
+	}
+	ffmpegArgs = append(ffmpegArgs, "-vf", ffmpegVF, "-q:v", "2", "-f", "image2pipe", "-vcodec", "mjpeg", "pipe:1")
+	ffmpegCmd := exec.CommandContext(sessionCtx, "ffmpeg", ffmpegArgs...)
 	var ffmpegErr bytes.Buffer
 	ffmpegCmd.Stderr = &ffmpegErr
-	if err := ffmpegCmd.Start(); err != nil {
-		log.Fatalf("Failed to start ffmpeg: %v", err)
+	stdout, err := ffmpegCmd.StdoutPipe()
+	if err != nil {
+		log.Printf("Failed to create ffmpeg output pipe: %v", err)
+		return "finished"
 	}
+	if err := ffmpegCmd.Start(); err != nil {
+		log.Printf("Failed to start ffmpeg: %v", err)
+		return "finished"
+	}
+
+	decodeDone := make(chan struct{})
 	go func() {
-		ffmpegCmd.Wait()
+		defer close(decodeDone)
+		defer close(jobs)
+		nextFrame := startFrame
+		streamErr := streamJPEGFrames(sessionCtx, stdout, func(jpeg []byte) error {
+			select {
+			case frameSlots <- struct{}{}:
+			case <-sessionCtx.Done():
+				return sessionCtx.Err()
+			}
+			job := renderJob{index: nextFrame, jpeg: jpeg}
+			select {
+			case jobs <- job:
+				nextFrame++
+				return nil
+			case <-sessionCtx.Done():
+				<-frameSlots
+				return sessionCtx.Err()
+			}
+		})
+		waitErr := ffmpegCmd.Wait()
+		if streamErr != nil && sessionCtx.Err() == nil {
+			log.Printf("FFmpeg frame stream failed: %v\r\n", streamErr)
+		}
+		if waitErr != nil && sessionCtx.Err() == nil && ffmpegErr.Len() > 0 {
+			log.Printf("FFmpeg failed: %s\r\n", strings.TrimSpace(ffmpegErr.String()))
+		}
 		stateMutex.Lock()
 		extractionComplete = true
 		frameReadyCond.Broadcast()
 		stateMutex.Unlock()
 	}()
+	renderDone := make(chan struct{})
+	go func() {
+		defer close(renderDone)
+		<-decodeDone
+		wgRender.Wait()
+		stateMutex.Lock()
+		renderingComplete = true
+		frameReadyCond.Broadcast()
+		stateMutex.Unlock()
+	}()
 
 	// --- Playback Loop ---
-	playbackLoop(ctx)
+	playbackLoop(sessionCtx, frameStore, frameSlots)
+	sessionCancel()
 
-	wgRender.Wait()
+	<-decodeDone
+	<-renderDone
 
 	stateMutex.Lock()
 	finalAction := userAction
@@ -305,7 +487,7 @@ func playVideo(ctx context.Context, path string) string {
 	return "finished"
 }
 
-func playbackLoop(ctx context.Context) {
+func playbackLoop(ctx context.Context, frameStore *renderedFrameStore, frameSlots chan struct{}) {
 	for {
 		stateMutex.Lock()
 		// Check for exit conditions first
@@ -318,13 +500,19 @@ func playbackLoop(ctx context.Context) {
 			return // Video finished naturally
 		}
 
-		// Wait for the current frame to be rendered
-		for lastRenderedFrame < currentFrameIndex && ctx.Err() == nil {
+		// Wait for the current frame to be rendered.
+		content, ready := frameStore.frames[currentFrameIndex]
+		for !ready && !renderingComplete && ctx.Err() == nil {
 			printInfoUnlocked("BUFFERING", currentFrameIndex, height, fps, -1, totalFrames)
 			frameReadyCond.Wait()
+			content, ready = frameStore.frames[currentFrameIndex]
 		}
 
 		if ctx.Err() != nil {
+			stateMutex.Unlock()
+			return
+		}
+		if !ready {
 			stateMutex.Unlock()
 			return
 		}
@@ -338,13 +526,11 @@ func playbackLoop(ctx context.Context) {
 		}
 
 		frameStartTime := time.Now()
-		var content []byte
 		frameIdx := currentFrameIndex
-		if frameIdx < len(renderedFrames) {
-			content = renderedFrames[frameIdx]
-		}
+		content, _ = frameStore.take(frameIdx)
 		currentFrameIndex++
 		stateMutex.Unlock()
+		<-frameSlots
 
 		if content == nil {
 			continue
@@ -371,15 +557,15 @@ func printHelp() {
             hitvid is a tool that uses ffmpeg and chafa to render and play videos in your terminal.
         It supports playlists, rich playback controls, and highly customizable rendering options.
 
-        Dependencies:
-            ffmpeg: Must be installed and in your system's PATH.
-            - chafa: Must be installed and in your system's PATH.
+		Dependencies:
+		    Compatibility build: ffmpeg and chafa must be in PATH.
+		    Native build: run make native and build with -tags native.
 
         Usage:
-            go run hitvid.go [options] <video file path>
+            go run . [options] <video file path>
 
         Example:
-            go run hitvid.go -fps 24 -colors full ./my_video.mp4
+            go run . -fps 24 -colors full ./my_video.mp4
 
         Command-line options:
             -video <path>
@@ -447,6 +633,11 @@ func main() {
 			os.Exit(1)
 		}
 	}
+	if err := validateNumThreads(numThreads); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		flag.Usage()
+		os.Exit(2)
+	}
 
 	seekAmountInFrames = seekSeconds * fps
 	frameReadyCond = sync.NewCond(&stateMutex)
@@ -491,49 +682,59 @@ func main() {
 	defer fmt.Print("\r\nPlayback finished. Thank you for using hitvid!\r\n")
 
 	// --- Main Control Loop ---
+	resumeFrame := 0
+	events := readInputEvents()
 	for {
 		ctx, cancel := context.WithCancel(context.Background())
 
-		// Start the single input handler for the entire application lifecycle
+		// Route events to this playback session without creating another stdin reader.
 		inputDone := make(chan struct{})
 		go func() {
-			handleInput(cancel)
+			handleInput(ctx, events, cancel)
 			close(inputDone)
 		}()
 
-		action := playVideo(ctx, playlist[currentVideoIndex])
+		action := playVideo(ctx, playlist[currentVideoIndex], resumeFrame)
 		cancel() // Ensure everything from the previous video is stopped
+		<-inputDone
 
 		switch action {
+		case "seek-forward":
+			stateMutex.Lock()
+			resumeFrame = seekTargetFrame(currentFrameIndex, seekAmountInFrames, totalFrames)
+			stateMutex.Unlock()
+			continue
+		case "seek-backward":
+			stateMutex.Lock()
+			resumeFrame = seekTargetFrame(currentFrameIndex, -seekAmountInFrames, totalFrames)
+			stateMutex.Unlock()
+			continue
 		case "next":
 			currentVideoIndex = (currentVideoIndex + 1) % len(playlist)
+			resumeFrame = 0
 		case "prev":
 			currentVideoIndex = (currentVideoIndex - 1 + len(playlist)) % len(playlist)
+			resumeFrame = 0
 		case "quit":
-			stateMutex.Lock()
-			userAction = "quit" // Signal input handler to exit
-			stateMutex.Unlock()
-			<-inputDone // Wait for input handler to finish
 			return
 		case "finished":
+			resumeFrame = 0
 			printInfoUnlocked("FINISHED", 0, height, fps, 0, 0)
 			// Post-playback input loop
 		postLoop:
 			for {
-				buf := make([]byte, 3)
-				os.Stdin.Read(buf)
-				switch {
-				case buf[0] == 'q' || buf[0] == 3:
-					stateMutex.Lock()
-					userAction = "quit"
-					stateMutex.Unlock()
-					<-inputDone
+				event, ok := <-events
+				if !ok || event == inputQuit {
 					return
-				case buf[0] == '\x1b' && buf[1] == '[' && buf[2] == 'A': // Up
+				}
+				switch event {
+				case inputPrev:
 					currentVideoIndex = (currentVideoIndex - 1 + len(playlist)) % len(playlist)
+					resumeFrame = 0
 					break postLoop
-				case buf[0] == '\x1b' && buf[1] == '[' && buf[2] == 'B': // Down
+				case inputNext:
 					currentVideoIndex = (currentVideoIndex + 1) % len(playlist)
+					resumeFrame = 0
 					break postLoop
 				}
 			}

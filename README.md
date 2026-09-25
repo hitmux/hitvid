@@ -3,7 +3,7 @@
 [![Go Version](https://img.shields.io/badge/go-1.18+-blue.svg)](https://golang.org)
 [![License: AGPLv3](https://img.shields.io/badge/License-AGPLv3-yellow.svg)](https://opensource.org/licenses/AGPLv3)
 
-`hitvid` is a high-performance, feature-rich video player designed to run directly in your terminal. It leverages the power of **ffmpeg** for video processing and **chafa** for superior character-based rendering to deliver a smooth playback experience. It features a sophisticated concurrency model for pre-rendering frames, ensuring that playback is not hindered by on-the-fly processing.
+`hitvid` is a high-performance, feature-rich video player designed to run directly in your terminal. It uses **ffmpeg** for video processing and **chafa** for character-based rendering. Frames are streamed through memory with bounded buffering instead of being written to a temporary frame directory.
 
 We've completely rewritten hitvid in Go, achieving a performance leap! We've leveraged multiple technologies to accelerate video rendering. We now support Linux, macOS, Windows, and other platforms!
 
@@ -23,19 +23,19 @@ However, we still keep the previous shell version in the `/old` directory, leavi
 
 ## Dependencies
 
-Before using `hitvid`, you must have the following command-line tools installed and accessible in your system's `PATH`:
+The compatibility build uses the following command-line tools from your system's `PATH`:
 
-1.  **FFmpeg**: The core engine for decoding and extracting frames from video files.
+1.  **FFmpeg**: The core engine for decoding and streaming frames from video files.
     *   **APT or YUM Installation** `sudo apt install ffmpeg` or `sudo yum install ffmpeg` 
     *   **Website & Installation**: [ffmpeg.org](https://ffmpeg.org/download.html)
-2.  **Chafa**: The powerful utility for converting images into high-quality terminal character art.
+2.  **Chafa**: The utility for converting streamed images into terminal character art.
     *   **Website & Installation**: [hpjansson.org/chafa](https://hpjansson.org/chafa/)
     *   **APT or YUM Installation** `sudo apt install chafa` or `sudo yum install chafa` 
 
 ## Installation & Usage
 
 #### 1. Install Dependencies
-First, ensure you have installed Go (version 1.18+), ffmpeg, and chafa.
+First, ensure you have installed Go (version 1.24+), ffmpeg, and chafa for the compatibility build.
 
 #### 2. Get the Source
 Clone the repository to your local machine (note: example URL).
@@ -49,16 +49,16 @@ You can run the program directly using `go run`. This is useful for quick plays 
 
 ```bash
 # Basic usage
-go run hitvid.go /path/to/your/video.mp4
+go run . /path/to/your/video.mp4
 
 # Advanced usage with custom rendering options
-go run hitvid.go -fps 24 -colors full -symbols block /path/to/your/video.webm
+go run . -fps 24 -colors full -symbols block /path/to/your/video.webm
 ```
 
 #### 4. Build the Binary
 For a permanent and faster-launching command, build the executable.
 ```bash
-go build -o hitvid hitvid.go
+go build -o hitvid .
 ```
 Then you can run the compiled binary from anywhere:
 ```bash
@@ -104,19 +104,19 @@ Control playback with these keyboard shortcuts:
 
 The core of the player is a multi-stage pipeline that processes video frames asynchronously.
 
-1.  **Frame Extractor (`ffmpeg`)**: An `ffmpeg` process is spawned to read the video file, decode it, and save individual frames as JPG images into a temporary directory. This is the first producer.
+1.  **Frame Extractor (`ffmpeg`)**: FFmpeg is spawned with `image2pipe` and writes a JPEG stream to stdout. No extracted frame is written to a temporary directory.
 
-2.  **Job Dispatcher (Goroutine)**: A dedicated goroutine runs in the background, watching the temporary directory for new frame images. As soon as a frame appears, it creates a `renderJob` and pushes it into a buffered channel (`jobs`). This decouples frame extraction from frame rendering.
+2.  **Job Dispatcher (Goroutine)**: The Go reader splits the stream at JPEG boundaries and pushes complete images into a bounded channel. Backpressure stops FFmpeg from getting ahead of playback.
 
-3.  **Frame Renderers (`chafa` Workers)**: A pool of consumer goroutines (the number is set by `-threads`) concurrently pulls `renderJob`s from the `jobs` channel. Each worker invokes `chafa` on its assigned frame image to convert it into a pre-rendered string of terminal characters. The result is stored in the `renderedFrames` slice at the correct index.
+3.  **Frame Renderers (`chafa` Workers)**: Workers pass each JPEG through Chafa's stdin and store terminal output in a fixed-capacity in-memory store. Failed frames are recorded so playback cannot deadlock.
 
-4.  **Playback Loop (Main Goroutine)**: The final consumer is the main playback loop. It attempts to play `currentFrameIndex`. If the frame isn't rendered yet (`renderedFrames[currentFrameIndex]` is `nil`), it waits efficiently instead of spinning the CPU.
+4.  **Playback Loop (Main Goroutine)**: Playback waits on a condition variable for the next indexed frame, consumes it, and releases its buffer slot. The cache cannot grow with video duration.
 
 #### 2. Advanced Synchronization
 
 Managing the state between these concurrent parts is critical.
 
-*   **`sync.Mutex (stateMutex)`**: A global mutex protects shared state variables like `isPaused`, `currentFrameIndex`, `totalFrames`, `lastRenderedFrame`, and user input actions. This prevents race conditions when, for example, the user pauses playback at the same time a new frame is rendered.
+*   **`sync.Mutex (stateMutex)`**: A global mutex protects shared state variables such as `isPaused`, `currentFrameIndex`, `totalFrames`, and user input actions. This prevents race conditions when playback and rendering progress concurrently.
 
 *   **`sync.Cond (frameReadyCond)`**: This is the key to efficient waiting. The playback loop uses `frameReadyCond.Wait()` when it needs a frame that hasn't been rendered yet. This puts the goroutine to sleep, consuming no CPU. When a rendering worker finishes a frame, it calls `frameReadyCond.Broadcast()`, which wakes up the playback loop to re-check if its required frame is now available. This is vastly more efficient than a `time.Sleep()` loop.
 
@@ -125,6 +125,19 @@ Managing the state between these concurrent parts is critical.
 *   **`context.Context`**: A `context.WithCancel` is created for each video played. This `context` is passed down to every goroutine and `exec.Command` related to that video. When the user quits, skips to the next video, or the video finishes, `cancel()` is called. This sends a cancellation signal down the entire chain, gracefully terminating `ffmpeg`, any running `chafa` processes, and all associated goroutines, ensuring no orphaned processes are left behind.
 
 *   **Main Control Loop**: The `main()` function contains the top-level control loop. It manages the playlist, handles transitions between videos (`next`, `prev`), and re-initializes the state for each new video. This outer loop is responsible for the application's overall lifecycle, while the `playVideo` function manages the lifecycle of a single video playback session.
+
+## Native build
+
+The repository includes a C bridge for linking FFmpeg and Chafa as static
+libraries. It uses FFmpeg's decoder API and Chafa's RGB canvas API directly,
+without command-line processes or image loaders. Build it with `make native`;
+generated files are kept under `native/build/`. The bridge requires a C
+toolchain, Meson, Autotools, and the corresponding LGPL source and notices.
+
+```bash
+make native
+go build -tags native -o hitvid-native .
+```
 
 ## License
 

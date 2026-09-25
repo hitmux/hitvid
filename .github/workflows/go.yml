@@ -1,0 +1,19 @@
+name: Go
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test-and-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: go test ./...
+      - run: go run . -help
+      - run: go build -o hitvid .
+      - name: Check unsupported native target package setup
+        run: GOOS=linux GOARCH=arm64 CGO_ENABLED=1 go test -c -tags native -o /tmp/hitvid-arm64.test

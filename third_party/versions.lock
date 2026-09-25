@@ -1,0 +1,4 @@
+# Native media dependency versions used by scripts/build-native.sh.
+ffmpeg=7.1.1
+chafa=1.14.5
+glib=2.84.4
