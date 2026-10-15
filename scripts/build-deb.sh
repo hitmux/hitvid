@@ -49,8 +49,8 @@ Version: $VERSION
 Section: video
 Priority: optional
 Architecture: $ARCH
-Maintainer: Hitmux <support@hitmux.org>
-Homepage: https://hitmux.org
+Maintainer: Hitmux <support@hitmux.com>
+Homepage: https://hitmux.com
 Description: standalone high-performance terminal video player
  hitvid plays video files directly in a terminal with FFmpeg and Chafa linked
  into the executable. No ffmpeg, ffprobe, chafa, or shared-library runtime
