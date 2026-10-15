@@ -9,7 +9,7 @@ The release backend decodes frames with the embedded FFmpeg libraries, converts 
 
 However, we still keep the previous shell version in the `/old` directory, leaving it as a last resort for platforms that are really incompatible (although there are almost no such platforms).
 
-## [Hitmux Official Website https://hitmux.org](https://hitmux.org)
+## [Hitmux Official Website https://hitmux.com](https://hitmux.com)
 
 ## Key Features
 
